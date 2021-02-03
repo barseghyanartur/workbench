@@ -30,7 +30,7 @@ def _period(weeks, min, max):
 
 
 class Planning:
-    def __init__(self, *, weeks, users=None):
+    def __init__(self, *, weeks, users=None, all_worked_hours=False):
         self.weeks = weeks
         self.users = users
 
@@ -42,6 +42,7 @@ class Planning:
         self._user_ids = {user.id for user in users} if users else set()
 
         self._worked_hours = defaultdict(lambda: defaultdict(lambda: Z1))
+        self._all_worked_hours = all_worked_hours
 
         self._absences = defaultdict(lambda: [0] * len(weeks))
 
@@ -134,14 +135,25 @@ class Planning:
             self._user_ids |= {user.id for user in pr.receivers.all()}
 
     def add_worked_hours(self, queryset):
+        if not self._all_worked_hours:
+            queryset = queryset.filter(service__project__in=self._project_ids)
+
+        date_from = min(self.weeks)
+        date_until = max(self.weeks) + dt.timedelta(days=6)
+
         for row in (
-            queryset.filter(service__project__in=self._project_ids)
+            queryset.filter(rendered_on__range=[date_from, date_until])
             .values("service__project", "service__offer", "rendered_on")
             .annotate(Sum("hours"))
         ):
             self._worked_hours[row["service__project"]][
                 monday(row["rendered_on"])
             ] += row["hours__sum"]
+
+        from workbench.projects.models import Project
+
+        for project in Project.objects.filter(id__in=self._worked_hours):
+            self._projects_offers[project]
 
     def add_absences(self, queryset):
         for absence in queryset.filter(
@@ -252,12 +264,14 @@ class Planning:
             ),
         )
 
-        if not offers:
+        if not offers and (
+            not self._all_worked_hours or not self._worked_hours[project.id]
+        ):
             return None
 
-        date_from = min(rec["offer"]["date_from"] for rec in offers)
-        date_until = max(rec["offer"]["date_until"] for rec in offers)
-        hours = sum(rec["offer"]["planned_hours"] for rec in offers)
+        date_from = min([rec["offer"]["date_from"] for rec in offers] + [dt.date.max])
+        date_until = max([rec["offer"]["date_until"] for rec in offers] + [dt.date.min])
+        hours = sum((rec["offer"]["planned_hours"] for rec in offers), Z1)
 
         return {
             "project": {
@@ -370,7 +384,7 @@ where percentage is not NULL -- NULL produced by outer join
 def user_planning(user, date_range):
     start, end = date_range
     weeks = list(takewhile(lambda x: x <= end, recurring(monday(start), "weekly")))
-    planning = Planning(weeks=weeks, users=[user])
+    planning = Planning(weeks=weeks, users=[user], all_worked_hours=True)
     planning.add_planned_work(user.planned_work.all())
     planning.add_planning_requests(user.received_planning_requests.all())
     planning.add_worked_hours(user.loggedhours.all())
